@@ -10,18 +10,19 @@ export async function getCollections() {
   const { userId } = await auth();
   if (!userId) throw new Error("Unauthorized");
 
-  const user = await db.user.findUnique({
-    where: { clerkUserId: userId },
-  });
+  const users = await db.$queryRawUnsafe(
+    `SELECT * FROM User WHERE clerkUserId = ? LIMIT 1`,
+    userId
+  );
 
-  if (!user) {
-    throw new Error("User not found");
-  }
+  if (users.length === 0) throw new Error("User not found");
 
-  const collections = await db.collection.findMany({
-    where: { userId: user.id },
-    orderBy: { createdAt: "desc" },
-  });
+  const user = users[0];
+
+  const collections = await db.$queryRawUnsafe(
+    `SELECT * FROM Collection WHERE userId = ? ORDER BY createdAt DESC`,
+    user.id
+  );
 
   return collections;
 }
@@ -31,13 +32,11 @@ export async function createCollection(data) {
     const { userId } = await auth();
     if (!userId) throw new Error("Unauthorized");
 
-    // Get request data for ArcJet
     const req = await request();
 
-    // Check rate limit
     const decision = await aj.protect(req, {
       userId,
-      requested: 1, // Specify how many tokens to consume
+      requested: 1,
     });
 
     if (decision.isDenied()) {
@@ -45,36 +44,40 @@ export async function createCollection(data) {
         const { remaining, reset } = decision.reason;
         console.error({
           code: "RATE_LIMIT_EXCEEDED",
-          details: {
-            remaining,
-            resetInSeconds: reset,
-          },
+          details: { remaining, resetInSeconds: reset },
         });
-
         throw new Error("Too many requests. Please try again later.");
       }
-
       throw new Error("Request blocked");
     }
 
-    const user = await db.user.findUnique({
-      where: { clerkUserId: userId },
-    });
+    const users = await db.$queryRawUnsafe(
+      `SELECT * FROM User WHERE clerkUserId = ? LIMIT 1`,
+      userId
+    );
 
-    if (!user) {
-      throw new Error("User not found");
-    }
+    if (users.length === 0) throw new Error("User not found");
 
-    const collection = await db.collection.create({
-      data: {
-        name: data.name,
-        description: data.description,
-        userId: user.id,
-      },
-    });
+    const user = users[0];
+
+    const newId = crypto.randomUUID(); // or use `cuid` if preferred
+
+    await db.$executeRawUnsafe(
+      `INSERT INTO Collection (id, name, description, userId, createdAt, updatedAt)
+       VALUES (?, ?, ?, ?, NOW(), NOW())`,
+      newId,
+      data.name,
+      data.description,
+      user.id
+    );
+
+    const newCollection = await db.$queryRawUnsafe(
+      `SELECT * FROM Collection WHERE id = ?`,
+      newId
+    );
 
     revalidatePath("/dashboard");
-    return collection;
+    return newCollection[0];
   } catch (error) {
     throw new Error(error.message);
   }
@@ -85,26 +88,24 @@ export async function deleteCollection(id) {
     const { userId } = await auth();
     if (!userId) throw new Error("Unauthorized");
 
-    const user = await db.user.findUnique({
-      where: { clerkUserId: userId },
-    });
+    const users = await db.$queryRawUnsafe(
+      `SELECT * FROM User WHERE clerkUserId = ? LIMIT 1`,
+      userId
+    );
 
-    if (!user) throw new Error("User not found");
+    if (users.length === 0) throw new Error("User not found");
 
-    // Check if collection exists and belongs to user
-    const collection = await db.collection.findFirst({
-      where: {
-        id,
-        userId: user.id,
-      },
-    });
+    const user = users[0];
 
-    if (!collection) throw new Error("Collection not found");
+    const collections = await db.$queryRawUnsafe(
+      `SELECT * FROM Collection WHERE id = ? AND userId = ? LIMIT 1`,
+      id,
+      user.id
+    );
 
-    // Delete the collection (entries will be cascade deleted)
-    await db.collection.delete({
-      where: { id },
-    });
+    if (collections.length === 0) throw new Error("Collection not found");
+
+    await db.$executeRawUnsafe(`DELETE FROM Collection WHERE id = ?`, id);
 
     return true;
   } catch (error) {

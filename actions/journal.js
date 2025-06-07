@@ -13,13 +13,11 @@ export async function createJournalEntry(data) {
     const { userId } = await auth();
     if (!userId) throw new Error("Unauthorized");
 
-    // Get request data for ArcJet
     const req = await request();
 
-    // Check rate limit
     const decision = await aj.protect(req, {
       userId,
-      requested: 1, // Specify how many tokens to consume
+      requested: 1,
     });
 
     if (decision.isDenied()) {
@@ -27,50 +25,52 @@ export async function createJournalEntry(data) {
         const { remaining, reset } = decision.reason;
         console.error({
           code: "RATE_LIMIT_EXCEEDED",
-          details: {
-            remaining,
-            resetInSeconds: reset,
-          },
+          details: { remaining, resetInSeconds: reset },
         });
-
         throw new Error("Too many requests. Please try again later.");
       }
-
       throw new Error("Request blocked");
     }
 
-    const user = await db.user.findUnique({
-      where: { clerkUserId: userId },
-    });
+    // Get user
+    const users = await db.$queryRawUnsafe(
+      `SELECT * FROM User WHERE clerkUserId = ? LIMIT 1`,
+      userId
+    );
+    if (users.length === 0) throw new Error("User not found");
+    const user = users[0];
 
-    if (!user) {
-      throw new Error("User not found");
-    }
-
-    // Get mood data
+    // Validate mood
     const mood = MOODS[data.mood.toUpperCase()];
     if (!mood) throw new Error("Invalid mood");
 
-    // Get mood image from Pixabay
     const moodImageUrl = await getPixabayImage(data.moodQuery);
 
-    // Create the entry
-    const entry = await db.entry.create({
-      data: {
-        title: data.title,
-        content: data.content,
-        mood: mood.id,
-        moodScore: mood.score,
-        moodImageUrl,
-        userId: user.id,
-        collectionId: data.collectionId || null,
-      },
-    });
+    // Create entry
+    const now = new Date();
+    const res = await db.$executeRawUnsafe(
+      `INSERT INTO Entry (title, content, mood, moodScore, moodImageUrl, userId, collectionId, createdAt, updatedAt)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      data.title,
+      data.content,
+      mood.id,
+      mood.score,
+      moodImageUrl,
+      user.id,
+      data.collectionId || null,
+      now,
+      now
+    );
 
-    // Delete existing draft after successful publication
-    await db.draft.deleteMany({
-      where: { userId: user.id },
-    });
+    // Get the created entry back (assuming auto-increment ID, get last inserted)
+    const entries = await db.$queryRawUnsafe(
+      `SELECT * FROM Entry WHERE userId = ? ORDER BY createdAt DESC LIMIT 1`,
+      user.id
+    );
+    const entry = entries[0];
+
+    // Delete drafts
+    await db.$executeRawUnsafe(`DELETE FROM Draft WHERE userId = ?`, user.id);
 
     revalidatePath("/dashboard");
     return entry;
@@ -81,124 +81,81 @@ export async function createJournalEntry(data) {
 
 export async function getJournalEntries({
   collectionId,
-  // ---- Filters can be implemented with backend as well ----
-  // mood = null,
-  // searchQuery = "",
-  // startDate = null,
-  // endDate = null,
-  // page = 1,
-  // limit = 10,
-  orderBy = "desc", // or "asc"
+  orderBy = "desc",
 } = {}) {
   try {
     const { userId } = await auth();
     if (!userId) throw new Error("Unauthorized");
 
-    const user = await db.user.findUnique({
-      where: { clerkUserId: userId },
-    });
+    const users = await db.$queryRawUnsafe(
+      `SELECT * FROM User WHERE clerkUserId = ? LIMIT 1`,
+      userId
+    );
+    if (users.length === 0) throw new Error("User not found");
+    const user = users[0];
 
-    if (!user) throw new Error("User not found");
+    let whereClause = "e.userId = ?";
+    const params = [user.id];
 
-    // Build where clause based on filters
-    const where = {
-      userId: user.id,
-      // If collectionId is explicitly null, get unorganized entries
-      // If it's undefined, get all entries
-      ...(collectionId === "unorganized"
-        ? { collectionId: null }
-        : collectionId
-        ? { collectionId }
-        : {}),
+    if (collectionId === "unorganized") {
+      whereClause += " AND e.collectionId IS NULL";
+    } else if (collectionId) {
+      whereClause += " AND e.collectionId = ?";
+      params.push(collectionId);
+    }
 
-      // ---- Filters can be implemented with backend as well ----
-      // ...(mood && { mood }),
-      // ...(searchQuery && {
-      //   OR: [
-      //     { title: { contains: searchQuery, mode: "insensitive" } },
-      //     { content: { contains: searchQuery, mode: "insensitive" } },
-      //   ],
-      // }),
-      // ...((startDate || endDate) && {
-      //   createdAt: {
-      //     ...(startDate && { gte: new Date(startDate) }),
-      //     ...(endDate && { lte: new Date(endDate) }),
-      //   },
-      // }),
-    };
+    const entries = await db.$queryRawUnsafe(
+      `SELECT e.*, c.id AS collectionId, c.name AS collectionName
+       FROM Entry e
+       LEFT JOIN Collection c ON e.collectionId = c.id
+       WHERE ${whereClause}
+       ORDER BY e.createdAt ${orderBy.toUpperCase()}`,
+      ...params
+    );
 
-    // ---- Get total count for pagination ----
-    // const totalEntries = await db.entry.count({ where });
-    // const totalPages = Math.ceil(totalEntries / limit);
-
-    // Get entries with pagination
-    const entries = await db.entry.findMany({
-      where,
-      include: {
-        collection: {
-          select: {
-            id: true,
-            name: true,
-          },
-        },
-      },
-      orderBy: {
-        createdAt: orderBy,
-      },
-      // skip: (page - 1) * limit,
-      // take: limit,
-    });
-
-    // Add mood data to each entry
     const entriesWithMoodData = entries.map((entry) => ({
       ...entry,
+      collection: entry.collectionId
+        ? { id: entry.collectionId, name: entry.collectionName }
+        : null,
       moodData: getMoodById(entry.mood),
     }));
 
     return {
       success: true,
-      data: {
-        entries: entriesWithMoodData,
-        // pagination: {
-        //   total: totalEntries,
-        //   pages: totalPages,
-        //   current: page,
-        //   hasMore: page < totalPages,
-        // },
-      },
+      data: { entries: entriesWithMoodData },
     };
   } catch (error) {
     return { success: false, error: error.message };
   }
 }
-
 export async function getJournalEntry(id) {
   try {
     const { userId } = await auth();
     if (!userId) throw new Error("Unauthorized");
 
-    const user = await db.user.findUnique({
-      where: { clerkUserId: userId },
-    });
+    const users = await db.$queryRawUnsafe(
+      `SELECT * FROM User WHERE clerkUserId = ? LIMIT 1`,
+      userId
+    );
+    if (users.length === 0) throw new Error("User not found");
+    const user = users[0];
 
-    if (!user) throw new Error("User not found");
+    const entries = await db.$queryRawUnsafe(
+      `SELECT e.*, c.id AS collectionId, c.name AS collectionName
+       FROM Entry e
+       LEFT JOIN Collection c ON e.collectionId = c.id
+       WHERE e.id = ? AND e.userId = ? LIMIT 1`,
+      id,
+      user.id
+    );
 
-    const entry = await db.entry.findFirst({
-      where: {
-        id,
-        userId: user.id,
-      },
-      include: {
-        collection: {
-          select: {
-            id: true,
-            name: true,
-          },
-        },
-      },
-    });
+    if (entries.length === 0) throw new Error("Entry not found");
 
-    if (!entry) throw new Error("Entry not found");
+    const entry = entries[0];
+    entry.collection = entry.collectionId
+      ? { id: entry.collectionId, name: entry.collectionName }
+      : null;
 
     return entry;
   } catch (error) {
@@ -211,29 +168,25 @@ export async function deleteJournalEntry(id) {
     const { userId } = await auth();
     if (!userId) throw new Error("Unauthorized");
 
-    const user = await db.user.findUnique({
-      where: { clerkUserId: userId },
-    });
+    const users = await db.$queryRawUnsafe(
+      `SELECT * FROM User WHERE clerkUserId = ? LIMIT 1`,
+      userId
+    );
+    if (users.length === 0) throw new Error("User not found");
+    const user = users[0];
 
-    if (!user) throw new Error("User not found");
+    const entries = await db.$queryRawUnsafe(
+      `SELECT * FROM Entry WHERE id = ? AND userId = ? LIMIT 1`,
+      id,
+      user.id
+    );
 
-    // Check if entry exists and belongs to user
-    const entry = await db.entry.findFirst({
-      where: {
-        id,
-        userId: user.id,
-      },
-    });
+    if (entries.length === 0) throw new Error("Entry not found");
 
-    if (!entry) throw new Error("Entry not found");
-
-    // Delete the entry
-    await db.entry.delete({
-      where: { id },
-    });
+    await db.$executeRawUnsafe(`DELETE FROM Entry WHERE id = ?`, id);
 
     revalidatePath("/dashboard");
-    return entry;
+    return entries[0];
   } catch (error) {
     throw new Error(error.message);
   }
@@ -244,48 +197,54 @@ export async function updateJournalEntry(data) {
     const { userId } = await auth();
     if (!userId) throw new Error("Unauthorized");
 
-    const user = await db.user.findUnique({
-      where: { clerkUserId: userId },
-    });
+    const users = await db.$queryRawUnsafe(
+      `SELECT * FROM User WHERE clerkUserId = ? LIMIT 1`,
+      userId
+    );
+    if (users.length === 0) throw new Error("User not found");
+    const user = users[0];
 
-    if (!user) throw new Error("User not found");
+    const entries = await db.$queryRawUnsafe(
+      `SELECT * FROM Entry WHERE id = ? AND userId = ? LIMIT 1`,
+      data.id,
+      user.id
+    );
 
-    // Check if entry exists and belongs to user
-    const existingEntry = await db.entry.findFirst({
-      where: {
-        id: data.id,
-        userId: user.id,
-      },
-    });
+    if (entries.length === 0) throw new Error("Entry not found");
+    const existingEntry = entries[0];
 
-    if (!existingEntry) throw new Error("Entry not found");
-
-    // Get mood data
     const mood = MOODS[data.mood.toUpperCase()];
     if (!mood) throw new Error("Invalid mood");
 
-    // Get new mood image if mood changed
     let moodImageUrl = existingEntry.moodImageUrl;
     if (existingEntry.mood !== mood.id) {
       moodImageUrl = await getPixabayImage(data.moodQuery);
     }
 
-    // Update the entry
-    const updatedEntry = await db.entry.update({
-      where: { id: data.id },
-      data: {
-        title: data.title,
-        content: data.content,
-        mood: mood.id,
-        moodScore: mood.score,
-        moodImageUrl,
-        collectionId: data.collectionId || null,
-      },
-    });
+    const now = new Date();
+    await db.$executeRawUnsafe(
+      `UPDATE Entry SET title = ?, content = ?, mood = ?, moodScore = ?, moodImageUrl = ?, collectionId = ?, updatedAt = ?
+       WHERE id = ?`,
+      data.title,
+      data.content,
+      mood.id,
+      mood.score,
+      moodImageUrl,
+      data.collectionId || null,
+      now,
+      data.id
+    );
+
+    // Return updated entry
+    const updatedEntries = await db.$queryRawUnsafe(
+      `SELECT * FROM Entry WHERE id = ? LIMIT 1`,
+      data.id
+    );
 
     revalidatePath("/dashboard");
     revalidatePath(`/journal/${data.id}`);
-    return updatedEntry;
+
+    return updatedEntries[0];
   } catch (error) {
     throw new Error(error.message);
   }
@@ -296,19 +255,19 @@ export async function getDraft() {
     const { userId } = await auth();
     if (!userId) throw new Error("Unauthorized");
 
-    const user = await db.user.findUnique({
-      where: { clerkUserId: userId },
-    });
+    const users = await db.$queryRawUnsafe(
+      `SELECT * FROM User WHERE clerkUserId = ? LIMIT 1`,
+      userId
+    );
+    if (users.length === 0) throw new Error("User not found");
+    const user = users[0];
 
-    if (!user) {
-      throw new Error("User not found");
-    }
+    const drafts = await db.$queryRawUnsafe(
+      `SELECT * FROM Draft WHERE userId = ? LIMIT 1`,
+      user.id
+    );
 
-    const draft = await db.draft.findUnique({
-      where: { userId: user.id },
-    });
-
-    return { success: true, data: draft };
+    return { success: true, data: drafts[0] || null };
   } catch (error) {
     return { success: false, error: error.message };
   }
@@ -319,31 +278,41 @@ export async function saveDraft(data) {
     const { userId } = await auth();
     if (!userId) throw new Error("Unauthorized");
 
-    const user = await db.user.findUnique({
-      where: { clerkUserId: userId },
-    });
+    const users = await db.$queryRawUnsafe(
+      `SELECT * FROM User WHERE clerkUserId = ? LIMIT 1`,
+      userId
+    );
+    if (users.length === 0) throw new Error("User not found");
+    const user = users[0];
 
-    if (!user) {
-      throw new Error("User not found");
+    // Upsert draft: Try update, else insert
+    const updated = await db.$executeRawUnsafe(
+      `UPDATE Draft SET title = ?, content = ?, mood = ? WHERE userId = ?`,
+      data.title,
+      data.content,
+      data.mood,
+      user.id
+    );
+
+    if (updated === 0) {
+      // No rows updated, insert instead
+      await db.$executeRawUnsafe(
+        `INSERT INTO Draft (title, content, mood, userId) VALUES (?, ?, ?, ?)`,
+        data.title,
+        data.content,
+        data.mood,
+        user.id
+      );
     }
 
-    const draft = await db.draft.upsert({
-      where: { userId: user.id },
-      create: {
-        title: data.title,
-        content: data.content,
-        mood: data.mood,
-        userId: user.id,
-      },
-      update: {
-        title: data.title,
-        content: data.content,
-        mood: data.mood,
-      },
-    });
-
     revalidatePath("/dashboard");
-    return { success: true, data: draft };
+
+    const drafts = await db.$queryRawUnsafe(
+      `SELECT * FROM Draft WHERE userId = ? LIMIT 1`,
+      user.id
+    );
+
+    return { success: true, data: drafts[0] };
   } catch (error) {
     return { success: false, error: error.message };
   }

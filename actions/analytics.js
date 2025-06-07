@@ -7,91 +7,85 @@ export async function getAnalytics(period = "30d") {
   const { userId } = await auth();
   if (!userId) throw new Error("Unauthorized");
 
-  const user = await db.user.findUnique({
-    where: { clerkUserId: userId },
-  });
+  try {
+    // 1. Get user via raw SQL
+    const users = await db.$queryRawUnsafe(
+      `SELECT * FROM User WHERE clerkUserId = ? LIMIT 1`,
+      userId
+    );
+    if (users.length === 0) throw new Error("User not found");
+    const user = users[0];
 
-  if (!user) throw new Error("User not found");
+    // 2. Calculate start date
+    const startDate = new Date();
+    const days = period === "7d" ? 7 : period === "15d" ? 15 : 30;
+    startDate.setDate(startDate.getDate() - days);
 
-  // Calculate start date based on period
-  const startDate = new Date();
-  switch (period) {
-    case "7d":
-      startDate.setDate(startDate.getDate() - 7);
-      break;
-    case "15d":
-      startDate.setDate(startDate.getDate() - 15);
-      break;
-    case "30d":
-    default:
-      startDate.setDate(startDate.getDate() - 30);
-      break;
-  }
+    // 3. Get entries via raw SQL
+    const entries = await db.$queryRawUnsafe(
+      `SELECT * FROM Entry WHERE userId = ? AND createdAt >= ? ORDER BY createdAt ASC`,
+      user.id,
+      startDate
+    );
 
-  // Get entries for the period
-  const entries = await db.entry.findMany({
-    where: {
-      userId: user.id,
-      createdAt: {
-        gte: startDate,
-      },
-    },
-    orderBy: {
-      createdAt: "asc",
-    },
-  });
+    // 4. Process entries
+    const moodData = entries.reduce((acc, entry) => {
+      const date = new Date(entry.createdAt).toISOString().split("T")[0];
+      if (!acc[date]) {
+        acc[date] = { totalScore: 0, count: 0, entries: [] };
+      }
+      acc[date].totalScore += entry.moodScore;
+      acc[date].count += 1;
+      acc[date].entries.push(entry);
+      return acc;
+    }, {});
 
-  // Process entries for analytics
-  const moodData = entries.reduce((acc, entry) => {
-    const date = entry.createdAt.toISOString().split("T")[0];
-    if (!acc[date]) {
-      acc[date] = {
-        totalScore: 0,
-        count: 0,
-        entries: [],
-      };
+    const analyticsData = Object.entries(moodData).map(([date, data]) => ({
+      date,
+      averageScore: Number((data.totalScore / data.count).toFixed(1)),
+      entryCount: data.count,
+    }));
+
+    const totalEntries = entries.length;
+    const averageScore = totalEntries
+      ? Number(
+          (
+            entries.reduce((sum, e) => sum + e.moodScore, 0) / totalEntries
+          ).toFixed(1)
+        )
+      : 0;
+
+    const moodCount = {};
+    for (const entry of entries) {
+      moodCount[entry.mood] = (moodCount[entry.mood] || 0) + 1;
     }
-    acc[date].totalScore += entry.moodScore;
-    acc[date].count += 1;
-    acc[date].entries.push(entry);
-    return acc;
-  }, {});
 
-  // Calculate averages and format data for charts
-  const analyticsData = Object.entries(moodData).map(([date, data]) => ({
-    date,
-    averageScore: Number((data.totalScore / data.count).toFixed(1)),
-    entryCount: data.count,
-  }));
+    const mostFrequentMood = Object.entries(moodCount).sort(
+      (a, b) => b[1] - a[1]
+    )[0]?.[0];
 
-  // Calculate overall statistics
-  const overallStats = {
-    totalEntries: entries.length,
-    averageScore: Number(
-      (
-        entries.reduce((acc, entry) => acc + entry.moodScore, 0) /
-        entries.length
-      ).toFixed(1)
-    ),
-    mostFrequentMood: Object.entries(
-      entries.reduce((acc, entry) => {
-        acc[entry.mood] = (acc[entry.mood] || 0) + 1;
-        return acc;
-      }, {})
-    ).sort((a, b) => b[1] - a[1])[0]?.[0],
-    dailyAverage: Number(
-      (
-        entries.length / (period === "7d" ? 7 : period === "15d" ? 15 : 30)
-      ).toFixed(1)
-    ),
-  };
+    const dailyAverage = Number((totalEntries / days).toFixed(1));
 
-  return {
-    success: true,
-    data: {
-      timeline: analyticsData,
-      stats: overallStats,
-      entries,
-    },
-  };
+    const overallStats = {
+      totalEntries,
+      averageScore,
+      mostFrequentMood,
+      dailyAverage,
+    };
+
+    return {
+      success: true,
+      data: {
+        timeline: analyticsData,
+        stats: overallStats,
+        entries,
+      },
+    };
+  } catch (err) {
+    console.error("Error generating analytics:", err.message);
+    return {
+      success: false,
+      error: err.message,
+    };
+  }
 }
